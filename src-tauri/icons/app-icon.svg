@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#15364b"/>
+      <stop offset="100%" stop-color="#08141f"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffb347"/>
+      <stop offset="100%" stop-color="#ff8f5a"/>
+    </linearGradient>
+    <linearGradient id="mint" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#69e5c1"/>
+      <stop offset="100%" stop-color="#2bb89a"/>
+    </linearGradient>
+  </defs>
+  <rect x="36" y="36" width="440" height="440" rx="112" fill="url(#bg)"/>
+  <path d="M148 144h216c29.823 0 54 24.177 54 54v116c0 29.823-24.177 54-54 54H148c-29.823 0-54-24.177-54-54V198c0-29.823 24.177-54 54-54z" fill="#0f2434" stroke="rgba(255,255,255,0.15)" stroke-width="8"/>
+  <path d="M162 184h188c17.673 0 32 14.327 32 32v80c0 17.673-14.327 32-32 32H162c-17.673 0-32-14.327-32-32v-80c0-17.673 14.327-32 32-32z" fill="none" stroke="url(#mint)" stroke-width="18"/>
+  <path d="M214 96l84 0 0 56-84 0z" fill="url(#accent)"/>
+  <path d="M286 96l80 80-80 0z" fill="url(#accent)"/>
+  <path d="M204 230h104" stroke="#eff6fb" stroke-width="24" stroke-linecap="round"/>
+  <path d="M236 264l20 20 44-44" fill="none" stroke="#eff6fb" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

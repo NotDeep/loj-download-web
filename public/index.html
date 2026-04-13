@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LibreOJ 题目包下载器</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <p class="eyebrow">LOYAL WORKHORSE</p>
+        <h1>LibreOJ 题目包下载器</h1>
+        <p class="hero-copy">
+          输入单个题号或一段题号区间，服务端会抓取题面、测试数据和附加文件，打成 zip 包后提供浏览器下载。
+        </p>
+        <div class="hero-meta">
+          <div>
+            <span class="label">目标站点</span>
+            <strong id="base-url">加载中...</strong>
+          </div>
+          <div>
+            <span class="label">保留策略</span>
+            <strong id="retention">加载中...</strong>
+          </div>
+        </div>
+      </header>
+
+      <main class="content-grid">
+        <section class="panel panel-primary">
+          <div class="panel-header">
+            <div>
+              <p class="section-label">New Job</p>
+              <h2>发起下载</h2>
+            </div>
+          </div>
+
+          <form id="download-form" class="download-form">
+            <label for="problem-input">题号或区间</label>
+            <div class="form-row">
+              <input
+                id="problem-input"
+                name="problem-input"
+                type="text"
+                inputmode="text"
+                placeholder="例如 1 或 1-10（最多 10 题）"
+                required
+              />
+              <button type="submit" id="submit-button">开始下载</button>
+            </div>
+            <p class="form-note" id="form-note">
+              支持单题号或区间，例如 `1`、`1-10`、`1..10`；区间长度最多 10 题。默认下载公开题目，如果服务端配置了 `LOJ_COOKIE`，也可以抓取登录后可见的题目。
+            </p>
+          </form>
+
+          <div id="flash" class="flash hidden"></div>
+
+          <section class="current-job" id="current-job">
+            <div class="empty-state">
+              <h3>还没有任务</h3>
+              <p>提交一个题号或题号区间后，这里会展示实时进度和下载入口。</p>
+            </div>
+          </section>
+        </section>
+
+        <aside class="panel panel-secondary">
+          <div class="panel-header">
+            <div>
+              <p class="section-label">Recent Jobs</p>
+              <h2>最近任务</h2>
+            </div>
+            <button type="button" class="ghost-button" id="refresh-button">刷新</button>
+          </div>
+          <div id="job-list" class="job-list">
+            <div class="empty-state compact">
+              <p>暂无历史任务。</p>
+            </div>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

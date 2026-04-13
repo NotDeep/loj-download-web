@@ -1,0 +1,24 @@
+[Unit]
+Description=LibreOJ Problem Package Downloader Web Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/loj-download-web
+EnvironmentFile=/etc/loj-download-web.env
+ExecStart=/usr/bin/env node /srv/loj-download-web/bin/loj-download-web.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+User=www-data
+Group=www-data
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/loj-download-web/storage
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

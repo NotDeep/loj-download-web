@@ -1,205 +1,373 @@
-import assert from "assert";
-import superagent, { SuperAgentRequest } from 'superagent';
-import { fs, size, yaml } from '@hydrooj/utils';
+import assert from 'assert';
+import fs from 'fs';
+import superagent from 'superagent';
+import type { SuperAgentRequest } from 'superagent';
 import { filter } from 'lodash';
-import Queue from 'p-queue';
 import AdmZip from 'adm-zip';
+import yaml from 'js-yaml';
 import path from 'path';
-import { create } from 'fancy-progress';
 import os from 'os';
-import proxy from 'superagent-proxy';
+import { TaskQueue } from './task-queue';
 
-const report1 = create('* Total', 'green');
-const report2 = create('Problem', 'red');
-
-proxy(superagent);
-const p = process.env.https_proxy || process.env.http_proxy || process.env.all_proxy || '';
-const queue = new Queue({ concurrency: 5 });
-
-const ScoreTypeMap = {
+const DEFAULT_BASE_URL = process.env.LOJ_BASE_URL || 'https://loj.ac';
+const DEFAULT_OUTPUT_ROOT = path.join(__dirname, 'downloads');
+const RE_SYZOJ = /(https?):\/\/([^/]+)\/(problem|p)\/([0-9]+)\/?/i;
+const ScoreTypeMap: Record<string, string> = {
     GroupMin: 'min',
     Sum: 'sum',
     GroupMul: 'max',
 };
-const LanguageMap = {
+const LanguageMap: Record<string, string> = {
     cpp: 'cc',
 };
-const RE_SYZOJ = /(https?):\/\/([^/]+)\/(problem|p)\/([0-9]+)\/?/i;
+const fileQueue = new TaskQueue({
+    concurrency: parsePositiveInteger(process.env.DOWNLOAD_CONCURRENCY, 5),
+});
 
-async function _download(url: string, path: string, retry: number) {
-    if (fs.existsSync(path)) fs.unlinkSync(path);
-    const w = fs.createWriteStream(path);
-    let req = superagent.get(url).retry(retry).timeout({ response: 3000, deadline: 60000 }).proxy(p);
-    req.pipe(w);
-    await new Promise((resolve, reject) => {
-        w.on('finish', resolve);
-        w.on('error', reject);
-        req.on('error', reject);
-        req.on('timeout', reject);
-    });
-    return path;
+export interface ProblemProgress {
+    stage: 'metadata' | 'download' | 'archive' | 'completed' | 'range';
+    progress: number;
+    message: string;
+    downloadedCount?: number;
+    totalCount?: number;
+    downloadedSize?: number;
+    totalSize?: number;
+    currentFile?: string;
+    currentProblemId?: number;
+    processedProblemCount?: number;
+    totalProblemCount?: number;
+    failedProblemIds?: number[];
 }
 
-function downloadFile(url: string): SuperAgentRequest;
-function downloadFile(url: string, path?: string, retry?: number);
-function downloadFile(url: string, path?: string, retry = 3) {
-    if (path) return _download(url, path, retry);
-    return superagent.get(url).timeout({ response: 3000, deadline: 60000 }).proxy(p).retry(retry);
+export interface RequestOptions {
+    cookie?: string;
+    retry?: number;
+    userAgent?: string;
+    timeout?: {
+        response: number;
+        deadline: number;
+    };
 }
 
-function createWriter(id) {
-    const dir = path.join(__dirname, 'downloads', id);
+export interface DownloadTreeOptions {
+    baseUrl?: string;
+    outputRoot?: string;
+    request?: RequestOptions;
+    onProblemProgress?: (progress: ProblemProgress) => void;
+}
+
+export interface DownloadArchiveOptions extends DownloadTreeOptions {
+    archiveDir?: string;
+}
+
+export interface RunOptions extends DownloadTreeOptions {
+    onTotalProgress?: (progress: number, message: string) => void;
+}
+
+export interface DownloadTreeResult {
+    baseUrl: string;
+    host: string;
+    problemId: number;
+    packageDir: string;
+    sourceUrl: string;
+}
+
+export interface DownloadArchiveResult extends DownloadTreeResult {
+    archiveName: string;
+    archivePath: string;
+}
+
+export interface DownloadRangeArchiveResult {
+    baseUrl: string;
+    host: string;
+    startId: number;
+    endId: number;
+    packageDir: string;
+    archiveName: string;
+    archivePath: string;
+    failedProblemIds: number[];
+    successfulProblemCount: number;
+}
+
+function parsePositiveInteger(value: string | undefined, fallback: number) {
+    if (!value) return fallback;
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) return fallback;
+    return parsed;
+}
+
+function normalizeBaseUrl(baseUrl = DEFAULT_BASE_URL) {
+    return baseUrl.replace(/\/+$/, '');
+}
+
+function sanitizeHost(host: string) {
+    return host.replace(/[^a-z0-9.-]+/gi, '_');
+}
+
+function formatBytes(value: number) {
+    if (!Number.isFinite(value) || value <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = value;
+    let index = 0;
+    while (size >= 1024 && index < units.length - 1) {
+        size /= 1024;
+        index += 1;
+    }
+    return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function toErrorMessage(error: unknown) {
+    if (error instanceof Error) return error.message;
+    return typeof error === 'string' ? error : 'Unknown error';
+}
+
+function removeIfExists(target: string) {
+    if (!fs.existsSync(target)) return;
+    const fileSystem = fs as typeof fs & {
+        removeSync?: (path: string) => void;
+        rmSync?: (path: string, options?: { force?: boolean; recursive?: boolean }) => void;
+    };
+    if (typeof fileSystem.rmSync === 'function') {
+        fileSystem.rmSync(target, { recursive: true, force: true });
+        return;
+    }
+    if (typeof fileSystem.removeSync === 'function') {
+        fileSystem.removeSync(target);
+        return;
+    }
+    throw new Error(`Cannot remove existing path: ${target}`);
+}
+
+function prepareRequest(request: SuperAgentRequest, options: RequestOptions = {}, retry = options.retry ?? 3) {
+    request.retry(retry).timeout(options.timeout || { response: 3000, deadline: 60000 });
+    if (options.cookie) request.set('Cookie', options.cookie);
+    request.set('User-Agent', options.userAgent || 'Mozilla/5.0 loj-download-web');
+    return request;
+}
+
+function createGetRequest(url: string, options: RequestOptions = {}, retry?: number) {
+    return prepareRequest(superagent.get(url), options, retry);
+}
+
+function createPostRequest(url: string, options: RequestOptions = {}, retry?: number) {
+    return prepareRequest(superagent.post(url), options, retry);
+}
+
+async function downloadToPath(url: string, targetPath: string, options: RequestOptions = {}, retry?: number) {
+    const attempts = retry ?? options.retry ?? 5;
+    const requestOptions: RequestOptions = {
+        ...options,
+        timeout: options.timeout || { response: 10000, deadline: 180000 },
+    };
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+        fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+        const request = createGetRequest(url, requestOptions, 0);
+        const writer = fs.createWriteStream(targetPath);
+
+        try {
+            request.pipe(writer);
+            await new Promise<void>((resolve, reject) => {
+                writer.on('finish', resolve);
+                writer.on('error', reject);
+                request.on('error', reject);
+                request.on('timeout', reject);
+            });
+            return targetPath;
+        } catch (error) {
+            lastError = error;
+            writer.destroy();
+            request.abort();
+            if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+            if (attempt === attempts) break;
+            await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+        }
+    }
+
+    throw lastError;
+}
+
+function createWriter(baseDir: string) {
     return (filename: string, content?: Buffer | string) => {
-        const target = path.join(dir, filename);
-        const targetDir = path.dirname(target);
-        if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
-        if (!content) return target;
-        fs.writeFileSync(target, content)
-        return '';
-    }
+        const targetPath = path.join(baseDir, filename);
+        fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+        if (content === undefined) return targetPath;
+        fs.writeFileSync(targetPath, content);
+        return targetPath;
+    };
 }
 
-async function v2(url: string) {
-    const res = await superagent.get(`${url}export`);
-    assert(res.status === 200, new Error('Cannot connect to target server'));
-    assert(res.body.success, new Error((res.body.error || {}).message));
-    const p = res.body.obj;
-    let c = '';
-    if (p.description) {
-        c += `## 题目描述\n${p.description}\n\n`
+function createProblemDirectory(outputRoot: string, host: string, problemId: number) {
+    const packageDir = path.join(path.resolve(outputRoot), host, String(problemId));
+    removeIfExists(packageDir);
+    fs.mkdirSync(packageDir, { recursive: true });
+    return packageDir;
+}
+
+function emitProblemProgress(options: DownloadTreeOptions, progress: ProblemProgress) {
+    options.onProblemProgress?.({
+        ...progress,
+        progress: Math.max(0, Math.min(1, progress.progress)),
+    });
+}
+
+function buildDownloadMessage(
+    name: string,
+    downloadedCount: number,
+    totalCount: number,
+    downloadedSize: number,
+    totalSize: number,
+) {
+    const countText = totalCount > 0 ? ` (${downloadedCount}/${totalCount})` : '';
+    if (totalSize > 0) {
+        return `${name}${countText} ${formatBytes(downloadedSize)}/${formatBytes(totalSize)}`;
     }
-    if (p.input_format) {
-        c += `## 输入格式\n${p.input_format}\n\n`
-    }
-    if (p.output_format) {
-        c += `## 输出格式\n${p.output_format}\n\n`
-    }
-    if (p.example) {
-        c += `## 样例\n${p.example}\n\n`
-    }
-    if (p.hint) {
-        c += `## 提示\n${p.hint}\n\n`
-    }
-    if (p.limit_and_hint) {
-        c += `## 限制与提示\n${p.limit_and_hint}\n\n`
-    }
-    const u = new URL(url);
-    const pid = u.pathname.split('problem/')[1].split('/')[0];
-    const write = createWriter(u.host + '/' + pid);
-    write('problem_zh.md', c);
+    return `${name}${countText}`;
+}
+
+async function downloadLegacyProblem(url: string, outputDir: string, options: DownloadTreeOptions) {
+    emitProblemProgress(options, {
+        stage: 'metadata',
+        progress: 0.05,
+        message: 'Fetching legacy problem metadata',
+    });
+    const res = await createGetRequest(`${url}export`, options.request).ok(() => true);
+    assert(res.status === 200, new Error('Cannot connect to target server.'));
+    assert(res.body.success, new Error((res.body.error || {}).message || 'Export API returned an error.'));
+    const problem = res.body.obj;
+    const problemUrl = new URL(url);
+    const pid = Number.parseInt(problemUrl.pathname.split('problem/')[1].split('/')[0], 10);
+    const write = createWriter(outputDir);
+    let content = '';
+    if (problem.description) content += `## 题目描述\n${problem.description}\n\n`;
+    if (problem.input_format) content += `## 输入格式\n${problem.input_format}\n\n`;
+    if (problem.output_format) content += `## 输出格式\n${problem.output_format}\n\n`;
+    if (problem.example) content += `## 样例\n${problem.example}\n\n`;
+    if (problem.hint) content += `## 提示\n${problem.hint}\n\n`;
+    if (problem.limit_and_hint) content += `## 限制与提示\n${problem.limit_and_hint}\n\n`;
+    write('problem_zh.md', content);
     write('problem.yaml', yaml.dump({
-        title: p.title,
+        title: problem.title,
         owner: 1,
-        tag: p.tags || [],
+        tag: problem.tags || [],
         pid: `P${pid}`,
         nSubmit: 0,
         nAccept: 0,
     }));
-    const r = downloadFile(`${url}testdata/download`);
-    const file = path.resolve(os.tmpdir(), 'hydro', `import_${pid}.zip`);
-    const w = fs.createWriteStream(file);
+
+    const tmpDir = path.resolve(os.tmpdir(), 'hydro');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const testdataArchive = path.join(tmpDir, `import_${pid}_${Date.now()}.zip`);
+
+    emitProblemProgress(options, {
+        stage: 'download',
+        progress: 0.2,
+        message: 'Downloading test data archive',
+    });
     try {
-        await new Promise((resolve, reject) => {
-            w.on('finish', resolve);
-            w.on('error', reject);
-            r.pipe(w);
-        });
-        const zip = new AdmZip(file);
-        const entries = zip.getEntries();
-        for (const entry of entries) {
+        await downloadToPath(`${url}testdata/download`, testdataArchive, options.request);
+        const zip = new AdmZip(testdataArchive);
+        for (const entry of zip.getEntries()) {
             if (entry.isDirectory) continue;
-            write('testdata/' + entry.entryName.split('/').pop(), entry.getData());
+            write(`testdata/${entry.entryName.split('/').pop()}`, entry.getData());
         }
-        const filename = p.file_io_input_name ? p.file_io_input_name.split('.')[0] : null;
-        const config = {
-            time: `${p.time_limit || 1000}ms`,
-            memory: `${p.memory_limit || 256}m`,
+        const filename = problem.file_io_input_name ? problem.file_io_input_name.split('.')[0] : null;
+        write('testdata/config.yaml', yaml.dump({
+            time: `${problem.time_limit || 1000}ms`,
+            memory: `${problem.memory_limit || 256}m`,
             filename,
-            type: p.type === 'traditional' ? 'default' : p.type,
-        };
-        write('testdata/config.yaml', yaml.dump(config));
+            type: problem.type === 'traditional' ? 'default' : problem.type,
+        }));
     } finally {
-        fs.unlinkSync(file);
+        if (fs.existsSync(testdataArchive)) fs.unlinkSync(testdataArchive);
     }
-    if (p.have_additional_file) {
-        const r1 = downloadFile(`${url}download/additional_file`);
-        const file1 = path.resolve(os.tmpdir(), 'hydro', `import_${pid}_a.zip`);
-        const w1 = fs.createWriteStream(file1);
+
+    if (problem.have_additional_file) {
+        const additionalArchive = path.join(tmpDir, `import_${pid}_a_${Date.now()}.zip`);
+        emitProblemProgress(options, {
+            stage: 'download',
+            progress: 0.75,
+            message: 'Downloading additional files archive',
+        });
         try {
-            await new Promise((resolve, reject) => {
-                w1.on('finish', resolve);
-                w1.on('error', reject);
-                r1.pipe(w1);
-            });
-            const zip = new AdmZip(file1);
-            const entries = zip.getEntries();
-            for (const entry of entries) {
-                write('additional_file/' + entry.entryName.replace(/\//g, '_'), entry.getData());
+            await downloadToPath(`${url}download/additional_file`, additionalArchive, options.request);
+            const zip = new AdmZip(additionalArchive);
+            for (const entry of zip.getEntries()) {
+                if (entry.isDirectory) continue;
+                write(`additional_file/${entry.entryName.replace(/\//g, '_')}`, entry.getData());
             }
         } finally {
-            fs.unlinkSync(file1);
+            if (fs.existsSync(additionalArchive)) fs.unlinkSync(additionalArchive);
         }
     }
+
+    emitProblemProgress(options, {
+        stage: 'completed',
+        progress: 1,
+        message: 'Problem package is ready',
+    });
 }
 
-async function v3(protocol: string, host: string, pid: number) {
-    report2.update(0, 'Fetching info');
-    const result = await superagent.post(`${protocol}://${host === 'loj.ac' ? 'api.loj.ac' : host}/api/problem/getProblem`)
+async function downloadV3Problem(
+    protocol: string,
+    host: string,
+    pid: number,
+    outputDir: string,
+    options: DownloadTreeOptions,
+) {
+    emitProblemProgress(options, {
+        stage: 'metadata',
+        progress: 0.05,
+        message: 'Fetching problem metadata',
+    });
+    const apiHost = host === 'loj.ac' ? 'api.loj.ac' : host;
+    const result = await createPostRequest(`${protocol}://${apiHost}/api/problem/getProblem`, options.request)
         .send({
-            displayId: pid,
-            localizedContentsOfAllLocales: true,
-            tagsOfLocale: 'zh_CN',
-            samples: true,
-            judgeInfo: true,
-            testData: true,
             additionalFiles: true,
-        })
-        .proxy(p);
-    if (!result.body.localizedContentsOfAllLocales) {
-        // Problem doesn't exist
-        return;
+            displayId: pid,
+            judgeInfo: true,
+            localizedContentsOfAllLocales: true,
+            samples: true,
+            tagsOfLocale: 'zh_CN',
+            testData: true,
+        });
+
+    if (result.body.error === 'PERMISSION_DENIED') {
+        throw new Error('Permission denied. This problem may require login. Configure LOJ_COOKIE on the server and try again.');
     }
-    const write = createWriter(host + '/' + pid);
-    for (const c of result.body.localizedContentsOfAllLocales) {
+    if (!result.body.localizedContentsOfAllLocales?.length) {
+        throw new Error('Problem not found or is not publicly accessible.');
+    }
+
+    const write = createWriter(outputDir);
+    for (const localizedContent of result.body.localizedContentsOfAllLocales) {
         let content = '';
-        const sections = c.contentSections;
         let add = false;
-        for (const section of sections) {
+        for (const section of localizedContent.contentSections) {
             if (section.type === 'Sample') {
                 if (section.sampleId === 0) add = true;
-                content += `\
-\`\`\`input${add ? section.sampleId + 1 : section.sampleId}
-${result.body.samples[section.sampleId].inputData}
-\`\`\`
-
-\`\`\`output${add ? section.sampleId + 1 : section.sampleId}
-${result.body.samples[section.sampleId].outputData}
-\`\`\`
-
-`;
-                if (section.text) {
-                    content += `
-
-${section.text}
-
-`;
-                }
-            } else {
-                content += '## ' + section.sectionTitle + '\n';
-                content += '\n' + section.text + '\n\n';
+                content += `\`\`\`input${add ? section.sampleId + 1 : section.sampleId}\n`;
+                content += `${result.body.samples[section.sampleId].inputData}\n`;
+                content += `\`\`\`\n\n`;
+                content += `\`\`\`output${add ? section.sampleId + 1 : section.sampleId}\n`;
+                content += `${result.body.samples[section.sampleId].outputData}\n`;
+                content += `\`\`\`\n\n`;
+                if (section.text) content += `${section.text}\n\n`;
+                continue;
             }
+            content += `## ${section.sectionTitle}\n\n${section.text}\n\n`;
         }
-        let locale = c.locale;
+        let locale = localizedContent.locale;
         if (locale === 'en_US') locale = 'en';
         else if (locale === 'zh_CN') locale = 'zh';
-        write('problem_' + locale + '.md', content);
+        write(`problem_${locale}.md`, content);
     }
-    const tags = result.body.tagsOfLocale.map((node) => node.name);
+
+    const tags = (result.body.tagsOfLocale || []).map((node) => node.name);
     const title = [
-        ...filter(
-            result.body.localizedContentsOfAllLocales,
-            (node) => node.locale === 'zh_CN',
-        ),
+        ...filter(result.body.localizedContentsOfAllLocales, (node) => node.locale === 'zh_CN'),
         ...result.body.localizedContentsOfAllLocales,
     ][0].title;
     write('problem.yaml', yaml.dump({
@@ -210,20 +378,18 @@ ${section.text}
         nSubmit: result.body.meta.submissionCount,
         nAccept: result.body.meta.acceptedSubmissionCount,
     }));
+
     const judge = result.body.judgeInfo;
-    const rename = {};
+    const rename: Record<string, string> = {};
     if (judge) {
-        report2.update(0, 'Fetching judge config');
-        const config: ProblemConfigFile = {
-            time: `${judge.timeLimit}ms`,
+        const config: Record<string, unknown> = {
             memory: `${judge.memoryLimit}m`,
+            time: `${judge.timeLimit}ms`,
         };
         if (judge.extraSourceFiles) {
             const files: string[] = [];
             for (const key in judge.extraSourceFiles) {
-                for (const file in judge.extraSourceFiles[key]) {
-                    files.push(file);
-                }
+                for (const file in judge.extraSourceFiles[key]) files.push(file);
             }
             config.user_extra_files = files;
         }
@@ -232,144 +398,376 @@ ${section.text}
             if (LanguageMap[judge.checker.language]) {
                 rename[judge.checker.filename] = `chk.${LanguageMap[judge.checker.language]}`;
                 config.checker = `chk.${LanguageMap[judge.checker.language]}`;
-            } else config.checker = judge.checker.filename;
+            } else {
+                config.checker = judge.checker.filename;
+            }
         }
         if (judge.fileIo?.inputFilename) {
             config.filename = judge.fileIo.inputFilename.split('.')[0];
         }
         if (judge.subtasks?.length) {
-            config.subtasks = [];
-            for (const subtask of judge.subtasks) {
-                const current: SubtaskConfig = {
+            config.subtasks = judge.subtasks.map((subtask) => {
+                const current: Record<string, unknown> = {
+                    cases: subtask.testcases.map((item) => ({
+                        input: item.inputFile,
+                        output: item.outputFile,
+                    })),
                     score: subtask.points,
                     type: ScoreTypeMap[subtask.scoringType],
-                    cases: subtask.testcases.map((i) => ({ input: i.inputFile, output: i.outputFile })),
                 };
                 if (subtask.dependencies) current.if = subtask.dependencies;
-                config.subtasks.push(current);
-            }
+                return current;
+            });
         }
         write('testdata/config.yaml', Buffer.from(yaml.dump(config)));
     }
-    let downloadedSize = 0;
-    let totalSize = result.body.testData.map(i => i.size).reduce((a, b) => a + b, 0)
-        + result.body.additionalFiles.map(i => i.size).reduce((a, b) => a + b, 0);
+
+    const testData = result.body.testData || [];
+    const additionalFiles = result.body.additionalFiles || [];
+    const totalCount = testData.length + additionalFiles.length;
+    const totalSize = testData.reduce((sum, item) => sum + item.size, 0)
+        + additionalFiles.reduce((sum, item) => sum + item.size, 0);
     let downloadedCount = 0;
-    let totalCount = result.body.testData.length + result.body.additionalFiles.length;
-    const [r, a] = await Promise.all([
-        superagent.post(`${protocol}://${host === 'loj.ac' ? 'api.loj.ac' : host}/api/problem/downloadProblemFiles`)
-            .send({
-                problemId: result.body.meta.id,
-                type: 'TestData',
-                filenameList: result.body.testData.map((node) => node.filename),
-            })
-            .proxy(p).timeout(10000).retry(5),
-        superagent.post(`${protocol}://${host === 'loj.ac' ? 'api.loj.ac' : host}/api/problem/downloadProblemFiles`)
-            .send({
-                problemId: result.body.meta.id,
-                type: 'AdditionalFile',
-                filenameList: result.body.additionalFiles.map((node) => node.filename),
-            })
-            .proxy(p).timeout(10000).retry(5),
-    ]);
-    if (r.body.error) throw new Error(r.body.error.message || r.body.error);
-    if (a.body.error) throw new Error(a.body.error.message || a.body.error);
-    const tasks: [name: string, type: 'testdata' | 'additional_file', url: string, size: number][] = [];
-    for (const f of r.body.downloadInfo) {
-        tasks.push([rename[f.filename] || f.filename, 'testdata', f.downloadUrl, result.body.testData.find(i => i.filename === f.filename).size]);
+    let downloadedSize = 0;
+
+    const testDataResponse = testData.length
+        ? await createPostRequest(
+            `${protocol}://${apiHost}/api/problem/downloadProblemFiles`,
+            {
+                ...options.request,
+                timeout: { response: 10000, deadline: 60000 },
+            },
+            5,
+        ).send({
+            filenameList: testData.map((node) => node.filename),
+            problemId: result.body.meta.id,
+            type: 'TestData',
+        })
+        : { body: { downloadInfo: [] } };
+    const additionalFilesResponse = additionalFiles.length
+        ? await createPostRequest(
+            `${protocol}://${apiHost}/api/problem/downloadProblemFiles`,
+            {
+                ...options.request,
+                timeout: { response: 10000, deadline: 60000 },
+            },
+            5,
+        ).send({
+            filenameList: additionalFiles.map((node) => node.filename),
+            problemId: result.body.meta.id,
+            type: 'AdditionalFile',
+        })
+        : { body: { downloadInfo: [] } };
+
+    if (testDataResponse.body.error) {
+        throw new Error(testDataResponse.body.error.message || testDataResponse.body.error);
     }
-    for (const f of a.body.downloadInfo) {
-        tasks.push([rename[f.filename] || f.filename, 'additional_file', f.downloadUrl, result.body.additionalFiles.find(i => i.filename === f.filename).size]);
+    if (additionalFilesResponse.body.error) {
+        throw new Error(additionalFilesResponse.body.error.message || additionalFilesResponse.body.error);
     }
-    let err;
-    for (const [name, type, url, expectedSize] of tasks) {
-        queue.add(async () => {
-            try {
-                const filepath = type + '/' + name;
-                if (fs.existsSync('downloads/' + host + '/' + pid + '/' + filepath)) {
-                    const size = fs.statSync('downloads/' + host + '/' + pid + '/' + filepath).size;
-                                        if (size === expectedSize) {
-                        downloadedSize += size;
-                        downloadedCount++;
-                        return;
-                    }else console.log(filepath,size,expectedSize);
-                }
-                await downloadFile(url, write(filepath));
-                downloadedSize += expectedSize;
-                downloadedCount++;
-                report2.update(downloadedSize / totalSize, `(${size(downloadedSize)}/${size(totalSize)}) ` + name + ' (' + (downloadedCount + 1) + '/' + totalCount + ')');
-            } catch (e) {
-                console.error(e)
-                err = e;
-            }
+
+    const tasks: Array<{
+        expectedSize: number;
+        filepath: string;
+        name: string;
+        url: string;
+    }> = [];
+    for (const file of testDataResponse.body.downloadInfo) {
+        const item = testData.find((node) => node.filename === file.filename);
+        tasks.push({
+            expectedSize: item?.size || 0,
+            filepath: `testdata/${rename[file.filename] || file.filename}`,
+            name: rename[file.filename] || file.filename,
+            url: file.downloadUrl,
         });
     }
-    await queue.onIdle();
-    if (err) throw err;
-    report2.update(downloadedSize / totalSize, '');
+    for (const file of additionalFilesResponse.body.downloadInfo) {
+        const item = additionalFiles.find((node) => node.filename === file.filename);
+        tasks.push({
+            expectedSize: item?.size || 0,
+            filepath: `additional_file/${rename[file.filename] || file.filename}`,
+            name: rename[file.filename] || file.filename,
+            url: file.downloadUrl,
+        });
+    }
+
+    if (!tasks.length) {
+        emitProblemProgress(options, {
+            stage: 'completed',
+            progress: 1,
+            message: 'Problem package is ready',
+        });
+        return;
+    }
+
+    emitProblemProgress(options, {
+        stage: 'download',
+        progress: 0.1,
+        message: 'Downloading problem files',
+        downloadedCount,
+        downloadedSize,
+        totalCount,
+        totalSize,
+    });
+
+    const taskResults = await Promise.allSettled(tasks.map((task) => fileQueue.add(async () => {
+        const targetPath = write(task.filepath);
+        if (fs.existsSync(targetPath)) {
+            const existingSize = fs.statSync(targetPath).size;
+            if (existingSize === task.expectedSize) {
+                downloadedCount += 1;
+                downloadedSize += task.expectedSize;
+                emitProblemProgress(options, {
+                    currentFile: task.name,
+                    downloadedCount,
+                    downloadedSize,
+                    message: buildDownloadMessage(task.name, downloadedCount, totalCount, downloadedSize, totalSize),
+                    progress: totalSize > 0 ? downloadedSize / totalSize : downloadedCount / totalCount,
+                    stage: 'download',
+                    totalCount,
+                    totalSize,
+                });
+                return;
+            }
+        }
+
+        await downloadToPath(task.url, targetPath, options.request);
+        downloadedCount += 1;
+        downloadedSize += task.expectedSize;
+        emitProblemProgress(options, {
+            currentFile: task.name,
+            downloadedCount,
+            downloadedSize,
+            message: buildDownloadMessage(task.name, downloadedCount, totalCount, downloadedSize, totalSize),
+            progress: totalSize > 0 ? downloadedSize / totalSize : downloadedCount / totalCount,
+            stage: 'download',
+            totalCount,
+            totalSize,
+        });
+    })));
+
+    const failedTask = taskResults.find((resultItem) => resultItem.status === 'rejected');
+    if (failedTask && failedTask.status === 'rejected') throw failedTask.reason;
+
+    emitProblemProgress(options, {
+        stage: 'completed',
+        progress: 1,
+        message: 'Problem package is ready',
+        downloadedCount,
+        downloadedSize,
+        totalCount,
+        totalSize,
+    });
 }
 
-async function run(url: string) {
-    if (/^(.+)\/(\d+)\.\.(\d+)$/.test(url)) {
-        const res = /^(.+)\/(\d+)\.\.(\d+)$/.exec(url)!;
-        let prefix = res[1];
-        const start = +res[2];
-        const end = +res[3];
-        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end) {
-            throw new Error('end');
+export async function downloadProblemTreeById(problemId: number, options: DownloadTreeOptions = {}) {
+    assert(Number.isSafeInteger(problemId) && problemId > 0, new Error('Problem id must be a positive integer.'));
+    const baseUrl = normalizeBaseUrl(options.baseUrl);
+    const base = new URL(baseUrl);
+    const packageDir = createProblemDirectory(options.outputRoot || DEFAULT_OUTPUT_ROOT, base.host, problemId);
+    await downloadV3Problem(base.protocol.slice(0, -1), base.host, problemId, packageDir, options);
+    return {
+        baseUrl,
+        host: base.host,
+        packageDir,
+        problemId,
+        sourceUrl: `${baseUrl}/p/${problemId}`,
+    } satisfies DownloadTreeResult;
+}
+
+export async function downloadProblemTreeByUrl(url: string, options: DownloadTreeOptions = {}) {
+    assert(url.match(RE_SYZOJ), new Error('This is not a valid SYZOJ/Lyrio problem detail page link.'));
+    let normalizedUrl = url;
+    if (!normalizedUrl.endsWith('/')) normalizedUrl += '/';
+    const [, protocol, host, type, pidText] = RE_SYZOJ.exec(normalizedUrl)!;
+    const problemId = Number.parseInt(pidText, 10);
+    const packageDir = createProblemDirectory(options.outputRoot || DEFAULT_OUTPUT_ROOT, host, problemId);
+
+    if (type === 'p') {
+        await downloadV3Problem(protocol, host, problemId, packageDir, options);
+    } else {
+        await downloadLegacyProblem(normalizedUrl, packageDir, options);
+    }
+
+    return {
+        baseUrl: `${protocol}://${host}`,
+        host,
+        packageDir,
+        problemId,
+        sourceUrl: normalizedUrl,
+    } satisfies DownloadTreeResult;
+}
+
+export function createProblemArchive(sourceDir: string, archivePath: string, rootName: string) {
+    fs.mkdirSync(path.dirname(archivePath), { recursive: true });
+    if (fs.existsSync(archivePath)) fs.unlinkSync(archivePath);
+    const zip = new AdmZip();
+    zip.addLocalFolder(sourceDir, rootName);
+    zip.writeZip(archivePath);
+    return archivePath;
+}
+
+export async function downloadProblemArchiveById(problemId: number, options: DownloadArchiveOptions = {}) {
+    const tree = await downloadProblemTreeById(problemId, options);
+    const archiveDir = path.resolve(options.archiveDir || options.outputRoot || DEFAULT_OUTPUT_ROOT);
+    const archiveName = `${sanitizeHost(tree.host)}-P${tree.problemId}.zip`;
+    const archivePath = path.join(archiveDir, archiveName);
+    emitProblemProgress(options, {
+        stage: 'archive',
+        progress: 0.95,
+        message: 'Creating archive',
+    });
+    createProblemArchive(tree.packageDir, archivePath, `${sanitizeHost(tree.host)}-P${tree.problemId}`);
+    emitProblemProgress(options, {
+        stage: 'completed',
+        progress: 1,
+        message: 'Download archive is ready',
+    });
+    return {
+        ...tree,
+        archiveName,
+        archivePath,
+    } satisfies DownloadArchiveResult;
+}
+
+export async function downloadProblemArchiveByRange(
+    startId: number,
+    endId: number,
+    options: DownloadArchiveOptions = {},
+) {
+    assert(Number.isSafeInteger(startId) && startId > 0, new Error('Range start must be a positive integer.'));
+    assert(Number.isSafeInteger(endId) && endId > 0, new Error('Range end must be a positive integer.'));
+    assert(startId <= endId, new Error('Range start cannot be greater than range end.'));
+
+    const baseUrl = normalizeBaseUrl(options.baseUrl);
+    const base = new URL(baseUrl);
+    const host = base.host;
+    const hostRootDir = path.join(path.resolve(options.outputRoot || DEFAULT_OUTPUT_ROOT), host);
+    removeIfExists(hostRootDir);
+    fs.mkdirSync(hostRootDir, { recursive: true });
+
+    const totalProblemCount = endId - startId + 1;
+    const failedProblemIds: number[] = [];
+    let successfulProblemCount = 0;
+    let processedProblemCount = 0;
+
+    for (let problemId = startId; problemId <= endId; problemId += 1) {
+        const problemDir = path.join(hostRootDir, String(problemId));
+        removeIfExists(problemDir);
+        fs.mkdirSync(problemDir, { recursive: true });
+
+        emitProblemProgress(options, {
+            currentProblemId: problemId,
+            failedProblemIds: [...failedProblemIds],
+            message: `Preparing P${problemId} (${processedProblemCount + 1}/${totalProblemCount})`,
+            processedProblemCount,
+            progress: processedProblemCount / totalProblemCount,
+            stage: 'range',
+            totalProblemCount,
+        });
+
+        try {
+            await downloadV3Problem(base.protocol.slice(0, -1), host, problemId, problemDir, {
+                ...options,
+                onProblemProgress(progress) {
+                    emitProblemProgress(options, {
+                        ...progress,
+                        currentProblemId: problemId,
+                        failedProblemIds: [...failedProblemIds],
+                        message: `P${problemId}: ${progress.message} (${processedProblemCount + 1}/${totalProblemCount})`,
+                        processedProblemCount,
+                        progress: (processedProblemCount + progress.progress) / totalProblemCount,
+                        totalProblemCount,
+                    });
+                },
+            });
+            successfulProblemCount += 1;
+        } catch (error) {
+            failedProblemIds.push(problemId);
+            removeIfExists(problemDir);
+            emitProblemProgress(options, {
+                currentProblemId: problemId,
+                failedProblemIds: [...failedProblemIds],
+                message: `Skipping P${problemId}: ${toErrorMessage(error)}`,
+                processedProblemCount: processedProblemCount + 1,
+                progress: (processedProblemCount + 1) / totalProblemCount,
+                stage: 'range',
+                totalProblemCount,
+            });
         }
-        let version = 2;
+
+        processedProblemCount += 1;
+    }
+
+    if (!successfulProblemCount) {
+        throw new Error(`No problems in range P${startId}-P${endId} were downloaded successfully.`);
+    }
+
+    const archiveDir = path.resolve(options.archiveDir || options.outputRoot || DEFAULT_OUTPUT_ROOT);
+    const archiveName = `${sanitizeHost(host)}-P${startId}-P${endId}.zip`;
+    const archivePath = path.join(archiveDir, archiveName);
+    emitProblemProgress(options, {
+        failedProblemIds: [...failedProblemIds],
+        message: `Creating archive for P${startId}-P${endId}`,
+        processedProblemCount: totalProblemCount,
+        progress: 0.95,
+        stage: 'archive',
+        totalProblemCount,
+    });
+    createProblemArchive(hostRootDir, archivePath, `${sanitizeHost(host)}-P${startId}-P${endId}`);
+    emitProblemProgress(options, {
+        failedProblemIds: [...failedProblemIds],
+        message: failedProblemIds.length
+            ? `Archive is ready. Failed: ${failedProblemIds.map((problemId) => `P${problemId}`).join(', ')}`
+            : 'Download archive is ready',
+        processedProblemCount: totalProblemCount,
+        progress: 1,
+        stage: 'completed',
+        totalProblemCount,
+    });
+
+    return {
+        archiveName,
+        archivePath,
+        baseUrl,
+        endId,
+        failedProblemIds,
+        host,
+        packageDir: hostRootDir,
+        startId,
+        successfulProblemCount,
+    } satisfies DownloadRangeArchiveResult;
+}
+
+export async function run(url: string, options: RunOptions = {}) {
+    const rangeMatch = /^(.+)\/(\d+)\.\.(\d+)$/.exec(url);
+    if (rangeMatch) {
+        let prefix = rangeMatch[1];
+        const start = Number.parseInt(rangeMatch[2], 10);
+        const end = Number.parseInt(rangeMatch[3], 10);
+        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end) {
+            throw new Error('Invalid problem range.');
+        }
         if (!prefix.endsWith('/')) prefix += '/';
+        let version = 2;
         if (prefix.endsWith('/p/')) version = 3;
         else prefix = `${prefix.split('/problem/')[0]}/problem/`;
         const base = `${prefix}${start}/`;
-        assert(base.match(RE_SYZOJ), new Error('prefix'));
+        assert(base.match(RE_SYZOJ), new Error('Invalid problem range prefix.'));
         const [, protocol, host] = RE_SYZOJ.exec(base)!;
         const count = end - start + 1;
-        for (let i = start; i <= end; i++) {
-            report1.update((i - start) / count, prefix + i + '');
-            if (version === 3) {
-                try {
-                    await v3(protocol, host, i);
-                } catch (e) {
-                    try {
-                        await v3(protocol, host, i);
-                    } catch (e) {
-                        console.error(e);
-                    }
-                }
-            } else await v2(`${prefix}${i}/`);
+        for (let current = start; current <= end; current += 1) {
+            options.onTotalProgress?.((current - start) / count, `${prefix}${current}`);
+            const targetUrl = version === 3
+                ? `${protocol}://${host}/p/${current}/`
+                : `${protocol}://${host}/problem/${current}/`;
+            await downloadProblemTreeByUrl(targetUrl, options);
         }
-        report2.update(1, '');
+        options.onTotalProgress?.(1, '');
         return;
     }
-    assert(url.match(RE_SYZOJ), new Error('This is not a valid SYZOJ/Lyrio problem detail page link.'));
-    if (!url.endsWith('/')) url += '/';
-    const [, protocol, host, n, pid] = RE_SYZOJ.exec(url)!;
-    if (n === 'p') await v3(protocol, host, +pid);
-    else await v2(url);
+
+    await downloadProblemTreeByUrl(url, options);
 }
 
-process.on('unhandledRejection', (e) => {
-    console.error(e);
-    setTimeout(() => {
-        console.error(e);
-        process.exit(1);
-    }, 1000);
-});
-process.on('uncaughtException', (e) => {
-    console.error(e);
-    setTimeout(() => {
-        console.error(e);
-        process.exit(1);
-    }, 1000);
-});
-
-if (!process.argv[2]) console.log('loj-download <url>');
-else run(process.argv[2]).catch(e => {
-    console.error(e);
-    setTimeout(() => {
-        console.error(e);
-        process.exit(1);
-    }, 1000);
-});
+export { normalizeBaseUrl };

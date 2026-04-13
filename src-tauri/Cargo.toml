@@ -1,0 +1,17 @@
+[package]
+name = "loj_download_desktop"
+version = "1.0.1"
+description = "LibreOJ problem package downloader desktop app"
+authors = ["OpenAI Codex"]
+edition = "2021"
+
+[lib]
+name = "loj_download_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
