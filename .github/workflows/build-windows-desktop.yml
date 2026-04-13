@@ -31,7 +31,7 @@ jobs:
         run: yarn install --frozen-lockfile
 
       - name: Build Windows desktop package
-        run: yarn desktop:build
+        run: yarn tauri build --bundles nsis
 
       - name: Upload Windows bundles
         uses: actions/upload-artifact@v6
@@ -39,5 +39,4 @@ jobs:
           name: loj-download-desktop-windows
           if-no-files-found: error
           path: |
-            src-tauri/target/release/bundle/msi/*.msi
             src-tauri/target/release/bundle/nsis/*.exe
