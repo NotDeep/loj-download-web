@@ -2,6 +2,11 @@ name: Build Windows Desktop
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/build-windows-desktop.yml
 
 jobs:
   build-windows:
