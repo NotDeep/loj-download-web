@@ -1,10 +1,10 @@
-use std::fs::create_dir_all;
+use std::fs::{create_dir_all, OpenOptions};
 use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::webview::WebviewWindowBuilder;
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl};
@@ -17,6 +17,36 @@ struct BackendState(Mutex<Option<CommandChild>>);
 fn other_error(message: impl Into<String>) -> IoError {
     IoError::new(ErrorKind::Other, message.into())
 }
+
+fn resolve_startup_log_path(app: &AppHandle) -> Option<PathBuf> {
+    let data_dir = app.path().app_local_data_dir().ok()?;
+    let log_dir = data_dir.join("logs");
+    create_dir_all(&log_dir).ok()?;
+    Some(log_dir.join("startup.log"))
+}
+
+fn append_startup_log(log_path: Option<&PathBuf>, message: impl AsRef<str>) {
+    let Some(log_path) = log_path else {
+        return;
+    };
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(file, "[{timestamp}] {}", message.as_ref());
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_startup_log(log_path: &Path) {
+    let _ = std::process::Command::new("notepad.exe").arg(log_path).spawn();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn reveal_startup_log(_: &Path) {}
 
 fn select_open_port() -> Result<u16, IoError> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -61,7 +91,7 @@ fn resolve_storage_dir(app: &AppHandle) -> Result<PathBuf, IoError> {
     Ok(storage_dir)
 }
 
-fn spawn_backend(app: &AppHandle, port: u16) -> Result<CommandChild, IoError> {
+fn spawn_backend(app: &AppHandle, port: u16, log_path: Option<PathBuf>) -> Result<CommandChild, IoError> {
     let entry_path = resolve_backend_entry(app)?;
     if !entry_path.exists() {
         return Err(other_error(format!(
@@ -83,6 +113,16 @@ fn spawn_backend(app: &AppHandle, port: u16) -> Result<CommandChild, IoError> {
         "24".into(),
     ];
 
+    append_startup_log(
+        log_path.as_ref(),
+        format!(
+            "Launching sidecar with entry={}, storage_dir={}, port={}",
+            entry_path.display(),
+            storage_dir.display(),
+            port
+        ),
+    );
+
     let (mut receiver, child) = app
         .shell()
         .sidecar("loj-download-node")
@@ -91,17 +131,23 @@ fn spawn_backend(app: &AppHandle, port: u16) -> Result<CommandChild, IoError> {
         .spawn()
         .map_err(|error| other_error(format!("Failed to spawn Node sidecar: {error}")))?;
 
+    let event_log_path = log_path.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = receiver.recv().await {
             match event {
                 CommandEvent::Stdout(line) => {
-                    println!("[desktop-backend] {}", String::from_utf8_lossy(&line));
+                    let message = String::from_utf8_lossy(&line).trim().to_string();
+                    println!("[desktop-backend] {message}");
+                    append_startup_log(event_log_path.as_ref(), format!("[stdout] {message}"));
                 }
                 CommandEvent::Stderr(line) => {
-                    eprintln!("[desktop-backend] {}", String::from_utf8_lossy(&line));
+                    let message = String::from_utf8_lossy(&line).trim().to_string();
+                    eprintln!("[desktop-backend] {message}");
+                    append_startup_log(event_log_path.as_ref(), format!("[stderr] {message}"));
                 }
                 CommandEvent::Error(message) => {
                     eprintln!("[desktop-backend] {message}");
+                    append_startup_log(event_log_path.as_ref(), format!("[error] {message}"));
                 }
                 _ => {}
             }
@@ -129,7 +175,7 @@ fn wait_for_backend(port: u16, timeout: Duration) -> Result<(), IoError> {
         thread::sleep(Duration::from_millis(150));
     }
 
-    Err(other_error("Desktop backend did not become healthy within 10 seconds."))
+    Err(other_error("Desktop backend did not become healthy within 30 seconds."))
 }
 
 fn kill_backend(app: &AppHandle) {
@@ -144,40 +190,75 @@ fn kill_backend(app: &AppHandle) {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             app.manage(BackendState::default());
+            let handle = app.handle();
+            let log_path = resolve_startup_log_path(&handle);
+            append_startup_log(log_path.as_ref(), "Desktop startup begin.");
 
-            let port = select_open_port()?;
-            let child = spawn_backend(&app.handle(), port)?;
-            *app
-                .state::<BackendState>()
-                .0
-                .lock()
-                .expect("backend state poisoned") = Some(child);
+            let startup_result = (|| -> Result<(), IoError> {
+                let port = select_open_port()?;
+                append_startup_log(log_path.as_ref(), format!("Selected localhost port {port}."));
 
-            wait_for_backend(port, Duration::from_secs(10))?;
+                let child = spawn_backend(&handle, port, log_path.clone())?;
+                *app
+                    .state::<BackendState>()
+                    .0
+                    .lock()
+                    .expect("backend state poisoned") = Some(child);
 
-            let url = format!("http://127.0.0.1:{port}/")
-                .parse()
-                .map_err(|error| other_error(format!("Failed to build desktop URL: {error}")))?;
+                append_startup_log(log_path.as_ref(), "Waiting for desktop backend health check.");
+                wait_for_backend(port, Duration::from_secs(30))?;
+                append_startup_log(log_path.as_ref(), "Desktop backend health check succeeded.");
 
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
-                .title("LibreOJ 题目包下载器")
-                .inner_size(1360.0, 920.0)
-                .min_inner_size(1100.0, 760.0)
-                .resizable(true)
-                .build()
-                .map_err(|error| other_error(format!("Failed to create main window: {error}")))?;
+                let url = format!("http://127.0.0.1:{port}/")
+                    .parse()
+                    .map_err(|error| other_error(format!("Failed to build desktop URL: {error}")))?;
+
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
+                    .title("LibreOJ 题目包下载器")
+                    .inner_size(1360.0, 920.0)
+                    .min_inner_size(1100.0, 760.0)
+                    .resizable(true)
+                    .build()
+                    .map_err(|error| other_error(format!("Failed to create main window: {error}")))?;
+
+                append_startup_log(log_path.as_ref(), "Main window created successfully.");
+                Ok(())
+            })();
+
+            if let Err(error) = startup_result {
+                append_startup_log(log_path.as_ref(), format!("Desktop startup failed: {error}"));
+                kill_backend(&handle);
+                if let Some(path) = log_path.as_ref() {
+                    reveal_startup_log(path);
+                }
+                return Err(error.into());
+            }
 
             Ok(())
         })
-        .build(tauri::generate_context!())
-        .expect("failed to build Tauri application")
-        .run(|app, event| {
+        .build(tauri::generate_context!());
+
+    match app {
+        Ok(app) => app.run(|app, event| {
             if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
                 kill_backend(app);
             }
-        });
+        }),
+        Err(error) => {
+            #[cfg(target_os = "windows")]
+            {
+                let log_path = std::env::temp_dir().join("loj-download-desktop-fatal.log");
+                let _ = std::fs::write(
+                    &log_path,
+                    format!("Failed to build Tauri application: {error}\n"),
+                );
+                reveal_startup_log(&log_path);
+            }
+            panic!("failed to build Tauri application: {error}");
+        }
+    }
 }
